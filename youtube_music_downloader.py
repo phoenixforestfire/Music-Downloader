@@ -1,6 +1,7 @@
 import sys
 import os
 import re
+import difflib
 import json
 import time
 import urllib.parse
@@ -1437,6 +1438,65 @@ def artist_affinity(a, b):
     return -5000
 
 
+def artwork_album_variants(album):
+    """Return useful MusicBrainz search variants for an album title."""
+    album = str(album or "").strip()
+    if not album:
+        return []
+
+    variants = [album]
+
+    # Digital stores frequently add edition labels that MusicBrainz stores
+    # separately or omits, e.g. "Cinematics (Expanded Edition)".
+    stripped = re.sub(
+        r"\s*[\[(][^\[\]()]+[\])]\s*$",
+        "",
+        album,
+    ).strip()
+
+    if stripped and stripped not in variants:
+        variants.append(stripped)
+
+    # Also try a punctuation-light form for titles where MusicBrainz uses a
+    # slightly different punctuation/spacing convention.
+    simplified = re.sub(
+        r"[^\w\s]",
+        " ",
+        unicodedata.normalize("NFKC", album),
+    )
+    simplified = re.sub(r"\s+", " ", simplified).strip()
+
+    if simplified and simplified not in variants:
+        variants.append(simplified)
+
+    return variants
+
+
+def artwork_album_match(wanted, candidate):
+    """Return True when two album names are close enough for artwork use."""
+    wanted_n = normalize_text(wanted)
+    candidate_n = normalize_text(candidate)
+
+    if not wanted_n or not candidate_n:
+        return False
+
+    if wanted_n == candidate_n:
+        return True
+
+    if wanted_n in candidate_n or candidate_n in wanted_n:
+        return True
+
+    # Protect against small spelling/transliteration differences such as
+    # "Finare" vs "Finale" while still requiring a very close title.
+    ratio = difflib.SequenceMatcher(
+        None,
+        wanted_n,
+        candidate_n,
+    ).ratio()
+
+    return ratio >= 0.88
+
+
 def search_releases_for_artwork(meta):
     """Find plausible album releases for artwork only.
 
@@ -1451,22 +1511,33 @@ def search_releases_for_artwork(meta):
     if not album:
         return []
 
+    album_variants = artwork_album_variants(album)
     searches = []
 
-    if artist and album:
-        searches.append(
-            (
-                f'release:"{album}" AND artist:"{artist}"',
-                "artist + album",
-            )
-        )
+    seen_queries = set()
 
-    searches.append(
-        (
-            f'release:"{album}"',
-            "album only",
-        )
-    )
+    for variant in album_variants:
+        if artist:
+            query = f'release:"{variant}" AND artist:"{artist}"'
+            if query not in seen_queries:
+                searches.append((query, "artist + album"))
+                seen_queries.add(query)
+
+        query = f'release:"{variant}"'
+        if query not in seen_queries:
+            searches.append((query, "album only"))
+            seen_queries.add(query)
+
+    # A short descriptive portion can help when the YouTube title contains a
+    # store-specific suffix or a small typo. This is deliberately limited so
+    # unrelated releases with a generic word like "Album" are not collected.
+    words = normalize_text(album).split()
+    if len(words) >= 3:
+        core = " ".join(words[: min(5, len(words))])
+        query = f'release:"{core}"'
+        if query not in seen_queries:
+            searches.append((query, "album core"))
+            seen_queries.add(query)
 
     seen = set()
     results = []
@@ -1491,7 +1562,11 @@ def search_releases_for_artwork(meta):
                 continue
 
             release_title = release.get("title", "")
-            if not same_text(album, release_title):
+
+            if not any(
+                artwork_album_match(variant, release_title)
+                for variant in album_variants
+            ):
                 continue
 
             release_artist = artist_credit_to_string(
