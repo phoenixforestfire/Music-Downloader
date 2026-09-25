@@ -5,6 +5,7 @@ import json
 import time
 import urllib.parse
 import urllib.request
+import unicodedata
 import subprocess
 from datetime import datetime
 
@@ -324,7 +325,10 @@ def normalize_text(text):
     if not text:
         return ""
 
-    text = str(text).lower()
+    text = unicodedata.normalize(
+        "NFKC",
+        str(text),
+    ).lower()
 
     text = (
         text
@@ -339,8 +343,10 @@ def normalize_text(text):
         text,
     )
 
+    # Keep Unicode letters and numbers so Japanese and other non-Latin
+    # album/track names can still be matched. Python's \w is Unicode-aware.
     text = re.sub(
-        r"[^a-z0-9\s]",
+        r"[^\w\s]",
         " ",
         text,
     )
@@ -566,32 +572,65 @@ def get_destination_folder():
 # ============================================================
 
 def request_json(url):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": MUSICBRAINZ_USER_AGENT,
-            "Accept": "application/json",
-        },
-    )
+    """Request JSON from MusicBrainz with retries for temporary failures."""
+    max_attempts = 3
 
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
-            return json.load(response)
-
-    except Exception as error:
-        print(
-            f"WARNING: Web request failed: {error}"
-        )
-        return None
-
-    finally:
-        time.sleep(
-            MUSICBRAINZ_DELAY
+    for attempt in range(1, max_attempts + 1):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": MUSICBRAINZ_USER_AGENT,
+                "Accept": "application/json",
+            },
         )
 
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
+                data = json.load(response)
+
+            time.sleep(MUSICBRAINZ_DELAY)
+            return data
+
+        except urllib.error.HTTPError as error:
+            retryable = error.code in {429, 500, 502, 503, 504}
+            if retryable and attempt < max_attempts:
+                retry_after = error.headers.get("Retry-After", "")
+                try:
+                    wait = max(2.0, float(retry_after))
+                except (TypeError, ValueError):
+                    wait = 3.0 * attempt
+
+                print(
+                    f"WARNING: MusicBrainz HTTP {error.code}; "
+                    f"retrying in {wait:.1f} seconds "
+                    f"(attempt {attempt + 1}/{max_attempts})..."
+                )
+                time.sleep(wait)
+                continue
+
+            print(f"WARNING: Web request failed: {error}")
+            time.sleep(MUSICBRAINZ_DELAY)
+            return None
+
+        except Exception as error:
+            if attempt < max_attempts:
+                wait = 2.0 * attempt
+                print(
+                    f"WARNING: Web request failed: {error}; "
+                    f"retrying in {wait:.1f} seconds "
+                    f"(attempt {attempt + 1}/{max_attempts})..."
+                )
+                time.sleep(wait)
+                continue
+
+            print(f"WARNING: Web request failed: {error}")
+            time.sleep(MUSICBRAINZ_DELAY)
+            return None
+
+    return None
 
 def download_binary(url):
     try:
@@ -1361,15 +1400,181 @@ def search_recordings(meta):
                     recording
                 )
 
-        if results and label in {
-            "ISRC",
-            "artist + track + album",
-            "artist + track",
-        }:
-            break
+        # Do not stop after the first successful search. MusicBrainz can
+        # return a poor recording match even when a better match is found
+        # by another query. Collect all candidates and let the scorer rank
+        # them instead.
 
     return results
 
+
+def artist_affinity(a, b):
+    """Return a score showing how closely two artist-credit strings relate."""
+    a_norm = normalize_text(a)
+    b_norm = normalize_text(b)
+
+    if not a_norm or not b_norm:
+        return 0
+
+    if a_norm == b_norm:
+        return 5000
+
+    if a_norm in b_norm or b_norm in a_norm:
+        return 2500
+
+    # YouTube and MusicBrainz often format multi-artist credits differently.
+    # Compare individual artist names as well as the complete credit string.
+    split_pattern = r'\s*(?:,|;|&|/|\band\b|\bfeat\.?\b|\bft\.?\b)\s*'
+    a_parts = [normalize_text(x) for x in re.split(split_pattern, str(a), flags=re.I) if normalize_text(x)]
+    b_parts = [normalize_text(x) for x in re.split(split_pattern, str(b), flags=re.I) if normalize_text(x)]
+
+    if any(x == y for x in a_parts for y in b_parts):
+        return 3000
+
+    if any((x in y or y in x) for x in a_parts for y in b_parts if x and y):
+        return 1800
+
+    return -5000
+
+
+def search_releases_for_artwork(meta):
+    """Find plausible album releases for artwork only.
+
+    YouTube metadata remains authoritative. These release records are used
+    only to find Cover Art Archive images. Artist matching is a ranking
+    factor, not a hard filter, because MusicBrainz and YouTube often format
+    multi-artist credits differently.
+    """
+    artist = meta.get("artist", "")
+    album = meta.get("album", "")
+
+    if not album:
+        return []
+
+    searches = []
+
+    if artist and album:
+        searches.append(
+            (
+                f'release:"{album}" AND artist:"{artist}"',
+                "artist + album",
+            )
+        )
+
+    searches.append(
+        (
+            f'release:"{album}"',
+            "album only",
+        )
+    )
+
+    seen = set()
+    results = []
+
+    for query, label in searches:
+        print(
+            f"MusicBrainz artwork search ({label}): {query}"
+        )
+
+        data = mb_search(
+            "release",
+            query,
+        )
+
+        if not data:
+            continue
+
+        for release in data.get("releases", []) or []:
+            release_id = release.get("id", "")
+
+            if not release_id or release_id in seen:
+                continue
+
+            release_title = release.get("title", "")
+            if not same_text(album, release_title):
+                continue
+
+            release_artist = artist_credit_to_string(
+                release.get("artist-credit", [])
+            )
+            group = release.get("release-group", {}) or {}
+
+            seen.add(release_id)
+            results.append(
+                {
+                    "release_id": release_id,
+                    "album": release_title,
+                    "artist": release_artist,
+                    "primary_type": group.get("primary-type", "") or "",
+                    "secondary_types": group.get("secondary-types", []) or [],
+                    "date": (
+                        release.get("date", "")
+                        or group.get("first-release-date", "")
+                    ),
+                    "status": release.get("status", ""),
+                }
+            )
+
+    return results
+
+def artwork_release_score(release, meta):
+    """Score an album release specifically for artwork use."""
+    score = 0
+
+    artist = release.get("artist", "")
+    album = release.get("album", "")
+    primary = normalize_text(release.get("primary_type", ""))
+    secondary = {
+        normalize_text(x)
+        for x in release.get("secondary_types", [])
+    }
+
+    score += artist_affinity(meta.get("artist", ""), artist)
+
+    if same_text(meta.get("album"), album):
+        score += 7000
+    elif loose_text(meta.get("album"), album):
+        score += 1500
+    else:
+        score -= 12000
+
+    requested_year = first_year(meta.get("year"))
+    release_year = first_year(release.get("date"))
+
+    if requested_year and release_year:
+        if requested_year == release_year:
+            score += 3000
+        else:
+            score -= 500
+
+    if primary == "album":
+        score += 1200
+    elif primary == "ep":
+        score += 200
+    elif primary == "single":
+        score -= 500
+
+    if not secondary:
+        score += 500
+
+    if "compilation" in secondary:
+        score -= 5000
+    if "live" in secondary:
+        score -= 3000
+    if "remix" in secondary:
+        score -= 3500
+    if "demo" in secondary:
+        score -= 2500
+    if "soundtrack" in secondary:
+        # A soundtrack is not automatically wrong. Keep it usable when the
+        # YouTube album itself is a soundtrack.
+        if normalize_text(meta.get("album")) != normalize_text(release.get("album")):
+            score -= 2000
+
+    if normalize_text(release.get("status")) == "official":
+        score += 500
+
+    return score
 
 def choose_musicbrainz_release(
     recordings,
@@ -1446,6 +1651,90 @@ def choose_musicbrainz_release(
             )
 
     if not choices:
+        # There may still be useful album releases for artwork even when
+        # MusicBrainz did not return a trustworthy recording match.
+        artwork_releases = search_releases_for_artwork(meta)
+        if artwork_releases:
+            artwork_releases.sort(
+                key=lambda x: -artwork_release_score(x, meta)
+            )
+            return {
+                "release_id": "",
+                "recording_id": "",
+                "artist": "",
+                "title": "",
+                "album": "",
+                "year": "",
+                "recording": {},
+                "release": {},
+                "isrc_match": False,
+                "score": 0,
+                "artwork_release_ids": [
+                    x["release_id"]
+                    for x in artwork_releases
+                    if artwork_release_score(x, meta) > 0
+                ][:10],
+            }
+        return None
+
+    # Reject clearly unrelated recording matches before choosing the
+    # metadata candidate. In particular, a remix/bootleg by another artist
+    # should never become the MusicBrainz backup for a YouTube song simply
+    # because its title happens to contain the requested title.
+    valid_choices = []
+
+    for candidate in choices:
+        artist_match = (
+            not meta.get("artist")
+            or same_text(meta.get("artist"), candidate.get("artist"))
+            or loose_text(meta.get("artist"), candidate.get("artist"))
+        )
+
+        album_match = (
+            not meta.get("album")
+            or same_text(meta.get("album"), candidate.get("album"))
+            or loose_text(meta.get("album"), candidate.get("album"))
+        )
+
+        title_match = (
+            not meta.get("title")
+            or same_text(meta.get("title"), candidate.get("title"))
+            or loose_text(meta.get("title"), candidate.get("title"))
+        )
+
+        if artist_match and album_match and title_match:
+            valid_choices.append(candidate)
+
+    if valid_choices:
+        choices = valid_choices
+    elif meta.get("artist") and meta.get("album"):
+        # Do not use an unrelated MusicBrainz recording to fill metadata.
+        # We can still search the exact album for artwork candidates.
+        artwork_releases = search_releases_for_artwork(meta)
+
+        artwork_releases.sort(
+            key=lambda x: -artwork_release_score(x, meta)
+        )
+
+        if artwork_releases:
+            return {
+                "release_id": "",
+                "recording_id": "",
+                "artist": "",
+                "title": "",
+                "album": "",
+                "year": "",
+                "recording": {},
+                "release": {},
+                "isrc_match": False,
+                "score": 0,
+                "artwork_release_ids": [
+                    x["release_id"]
+                    for x in artwork_releases
+                    if artwork_release_score(x, meta) > 0
+                ][:10],
+            }
+
         return None
 
     isrc_choices = [
@@ -1476,6 +1765,9 @@ def choose_musicbrainz_release(
     # strong matches are retained only as artwork fallbacks.
     best = ordered_choices[0]
 
+    # First use strong recording/release matches. Then broaden the artwork
+    # search with direct album-release results. The latter are artwork-only
+    # candidates and never replace YouTube metadata.
     artwork_release_ids = []
 
     for candidate in ordered_choices:
@@ -1492,8 +1784,23 @@ def choose_musicbrainz_release(
                 release_id
             )
 
-        # Ten candidates is enough to cover alternate editions
-        # without making artwork lookup unnecessarily large.
+        if len(artwork_release_ids) >= 10:
+            break
+
+    artwork_releases = search_releases_for_artwork(meta)
+    artwork_releases.sort(
+        key=lambda x: -artwork_release_score(x, meta)
+    )
+
+    for release in artwork_releases:
+        release_id = release.get("release_id", "")
+
+        if (
+            release_id
+            and release_id not in artwork_release_ids
+        ):
+            artwork_release_ids.append(release_id)
+
         if len(artwork_release_ids) >= 10:
             break
 
@@ -1742,6 +2049,18 @@ def get_musicbrainz_backup(meta):
     )
 
     if not recordings:
+        # Recording search can fail because of MusicBrainz naming/artist-credit
+        # differences. Still search the exact album for artwork candidates.
+        artwork_releases = search_releases_for_artwork(meta)
+        artwork_releases.sort(
+            key=lambda x: -artwork_release_score(x, meta)
+        )
+
+        meta["artwork_release_ids"] = [
+            x["release_id"]
+            for x in artwork_releases
+            if artwork_release_score(x, meta) > 0
+        ][:10]
         return meta, differences
 
     choice = choose_musicbrainz_release(
@@ -1762,6 +2081,9 @@ def get_musicbrainz_backup(meta):
         )
         or [choice.get("release_id", "")]
     )
+
+    if not choice.get("release_id"):
+        return meta, differences
 
     release = get_release_details(
         choice["release_id"]
@@ -2140,7 +2462,7 @@ def download_cover_art(
 
     if not release_ids:
         print(
-            "No MusicBrainz release ID available "
+            "No suitable MusicBrainz release was found "
             "for artwork."
         )
         return None, "unavailable"
