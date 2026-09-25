@@ -1461,17 +1461,45 @@ def choose_musicbrainz_release(
                 x["album"].lower(),
             )
         )
-
-        return isrc_choices[0]
-
-    choices.sort(
-        key=lambda x: (
-            -x["score"],
-            x["album"].lower(),
+        ordered_choices = isrc_choices
+    else:
+        choices.sort(
+            key=lambda x: (
+                -x["score"],
+                x["album"].lower(),
+            )
         )
-    )
+        ordered_choices = choices
 
-    return choices[0]
+    # The first choice remains the authoritative MusicBrainz
+    # candidate for filling missing metadata. The remaining
+    # strong matches are retained only as artwork fallbacks.
+    best = ordered_choices[0]
+
+    artwork_release_ids = []
+
+    for candidate in ordered_choices:
+        release_id = candidate.get(
+            "release_id",
+            "",
+        )
+
+        if (
+            release_id
+            and release_id not in artwork_release_ids
+        ):
+            artwork_release_ids.append(
+                release_id
+            )
+
+        # Ten candidates is enough to cover alternate editions
+        # without making artwork lookup unnecessarily large.
+        if len(artwork_release_ids) >= 10:
+            break
+
+    best["artwork_release_ids"] = artwork_release_ids
+
+    return best
 
 
 def get_release_details(
@@ -1723,6 +1751,17 @@ def get_musicbrainz_backup(meta):
 
     if not choice:
         return meta, differences
+
+    # MusicBrainz's best release remains the release used for
+    # missing metadata. These additional release IDs are ONLY
+    # used if the best release has no Cover Art Archive artwork.
+    meta["artwork_release_ids"] = (
+        choice.get(
+            "artwork_release_ids",
+            [],
+        )
+        or [choice.get("release_id", "")]
+    )
 
     release = get_release_details(
         choice["release_id"]
@@ -2078,14 +2117,32 @@ def find_existing_song(
 # ============================================================
 
 def download_cover_art(
-    release_id,
+    release_ids,
 ):
-    if not release_id:
+    if isinstance(
+        release_ids,
+        str,
+    ):
+        release_ids = (
+            [release_ids]
+            if release_ids
+            else []
+        )
+
+    release_ids = [
+        release_id
+        for release_id in (
+            release_ids
+            or []
+        )
+        if release_id
+    ]
+
+    if not release_ids:
         print(
             "No MusicBrainz release ID available "
             "for artwork."
         )
-
         return None, "unavailable"
 
     print()
@@ -2093,61 +2150,90 @@ def download_cover_art(
         "Searching Cover Art Archive..."
     )
 
-    url = (
-        "https://coverartarchive.org/release/"
-        + urllib.parse.quote(
-            release_id
-        )
-        + "/front-500"
-    )
+    saw_error = False
 
-    data, status = download_binary(
-        url
-    )
-
-    if not data:
-        if status == "not_found":
+    for index, release_id in enumerate(
+        release_ids,
+        start=1,
+    ):
+        if index == 1:
             print(
-                "No artwork found."
+                f"Trying primary MusicBrainz release: "
+                f"{release_id}"
             )
-            return None, "unavailable"
+        else:
+            print(
+                f"Trying alternate MusicBrainz release "
+                f"{index}: {release_id}"
+            )
 
-        print(
-            "ERROR: Could not download album artwork."
+        url = (
+            "https://coverartarchive.org/release/"
+            + urllib.parse.quote(
+                release_id
+            )
+            + "/front-500"
         )
 
+        data, status = download_binary(
+            url
+        )
+
+        if not data:
+            if status == "not_found":
+                print(
+                    "  No artwork found for this release."
+                )
+            else:
+                saw_error = True
+                print(
+                    "  Cover Art Archive request failed."
+                )
+            continue
+
+        artwork_file = os.path.join(
+            SCRIPT_DIRECTORY,
+            "_temporary_album_art.jpg",
+        )
+
+        try:
+            with open(
+                artwork_file,
+                "wb",
+            ) as file:
+                file.write(data)
+
+            if index == 1:
+                print(
+                    "Artwork downloaded."
+                )
+            else:
+                print(
+                    "Artwork downloaded from an "
+                    "alternate MusicBrainz release."
+                )
+
+            return artwork_file, "success"
+
+        except OSError as error:
+            print(
+                "ERROR: Could not save album artwork."
+            )
+            print(error)
+            return None, "file"
+
+    if saw_error:
+        print(
+            "ERROR: No usable artwork was found after "
+            "trying the matching MusicBrainz releases."
+        )
         return None, "error"
 
-    artwork_file = os.path.join(
-        SCRIPT_DIRECTORY,
-        "_temporary_album_art.jpg",
+    print(
+        "No artwork found in the matching "
+        "MusicBrainz releases."
     )
-
-    try:
-        with open(
-            artwork_file,
-            "wb",
-        ) as file:
-            file.write(data)
-
-        print(
-            "Artwork downloaded."
-        )
-
-        return artwork_file, "success"
-
-    except OSError as error:
-        print(
-            "ERROR: Could not save album artwork."
-        )
-        print(error)
-
-        return None, "file"
-
-
-# ============================================================
-# ID3 tagging
-# ============================================================
+    return None, "unavailable"
 
 def embed_metadata(
     mp3_file,
@@ -2734,8 +2820,8 @@ def process_item(
     artwork, artwork_status = (
         download_cover_art(
             final.get(
-                "release_id",
-                "",
+                "artwork_release_ids",
+                [],
             )
         )
     )
