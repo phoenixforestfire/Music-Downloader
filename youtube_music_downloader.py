@@ -1486,28 +1486,28 @@ def artwork_album_variants(album):
 
 
 def artwork_album_match(wanted, candidate):
-    """Return True when two album names are close enough for artwork use."""
+    """Match album identities conservatively for artwork selection."""
     wanted_n = normalize_text(wanted)
     candidate_n = normalize_text(candidate)
-
     if not wanted_n or not candidate_n:
         return False
-
     if wanted_n == candidate_n:
         return True
 
-    if wanted_n in candidate_n or candidate_n in wanted_n:
+    edition_pattern = re.compile(
+        r"\s+(?:deluxe|expanded|remastered|anniversary|special|bonus)"
+        r"(?:\s+edition|\s+version)?(?:\s+\d+)?$"
+    )
+    wanted_base = edition_pattern.sub("", wanted_n).strip()
+    candidate_base = edition_pattern.sub("", candidate_n).strip()
+    if wanted_base and candidate_base and wanted_base == candidate_base:
         return True
 
-    # Protect against small spelling/transliteration differences such as
-    # "Finare" vs "Finale" while still requiring a very close title.
-    ratio = difflib.SequenceMatcher(
-        None,
-        wanted_n,
-        candidate_n,
-    ).ratio()
+    return difflib.SequenceMatcher(None, wanted_n, candidate_n).ratio() >= 0.96
 
-    return ratio >= 0.88
+
+def strict_artwork_album_match(wanted, candidate):
+    return artwork_album_match(wanted, candidate)
 
 
 def search_releases_for_artwork(meta):
@@ -1577,7 +1577,7 @@ def search_releases_for_artwork(meta):
             release_title = release.get("title", "")
 
             if not any(
-                artwork_album_match(variant, release_title)
+                strict_artwork_album_match(variant, release_title)
                 for variant in album_variants
             ):
                 continue
@@ -1713,22 +1713,24 @@ def recording_artwork_score(candidate, meta):
 
     if wanted_album:
         if same_text(wanted_album, release_album):
-            score += 1500
-        elif loose_text(wanted_album, release_album):
-            score += 700
-        elif artwork_album_match(wanted_album, release_album):
-            score += 400
+            score += 5000
+        elif strict_artwork_album_match(wanted_album, release_album):
+            score += 2500
         else:
-            # An album mismatch is only a small penalty because the recording
-            # itself is the important bridge to the release.
-            score -= 500
+            score -= 15000
 
     if primary == "album":
-        score += 800
+        score += 1200
     elif primary == "ep":
-        score += 200
+        score += 300
     elif primary == "single":
-        score += 100
+        if wanted_album and not strict_artwork_album_match(
+            wanted_album,
+            release_album,
+        ):
+            score -= 12000
+        else:
+            score += 200
 
     if not secondary:
         score += 300
@@ -1842,6 +1844,12 @@ def release_group_artwork_candidates(choices, meta, limit=20):
                 "status": release.get("status", ""),
                 "release_group_id": group_id,
             }
+            if meta.get("album") and not strict_artwork_album_match(
+                meta.get("album", ""),
+                item.get("album", ""),
+            ):
+                continue
+
             score = artwork_release_score(item, meta) + 800
             if score > 0:
                 seen_releases.add(release_id)
@@ -1852,11 +1860,18 @@ def release_group_artwork_candidates(choices, meta, limit=20):
 
 
 def release_contains_requested_recording(release, meta):
-    """Return True only if the release actually contains the requested track."""
+    """Require the release to be the requested album and contain the song."""
     wanted_title = normalize_text(meta.get("title", ""))
     wanted_artist = meta.get("artist", "")
+    wanted_album = meta.get("album", "")
     if not wanted_title:
         return False
+
+    release_album = release.get("title", "")
+    if wanted_album and not strict_artwork_album_match(wanted_album, release_album):
+        return False
+
+    release_artist = artist_credit_to_string(release.get("artist-credit", []))
 
     for medium in release.get("media", []) or []:
         for track in medium.get("tracks", []) or []:
@@ -1864,11 +1879,11 @@ def release_contains_requested_recording(release, meta):
             title = recording.get("title", "")
             if not (same_text(wanted_title, title) or loose_text(wanted_title, title)):
                 continue
-
             recording_artist = artist_credit_to_string(recording.get("artist-credit", []))
-            if not wanted_artist or artist_affinity(wanted_artist, recording_artist) > 0:
+            if (not wanted_artist or
+                artist_affinity(wanted_artist, recording_artist) > 0 or
+                artist_affinity(wanted_artist, release_artist) > 0):
                 return True
-
     return False
 
 
@@ -2107,8 +2122,14 @@ def choose_musicbrainz_release(
             ):
                 artwork_release_ids.append(release_id)
 
-            if len(artwork_release_ids) >= 15:
+            if len(artwork_release_ids) >= 40:
                 break
+
+        artwork_release_ids = verify_artwork_releases(
+            artwork_release_ids,
+            meta,
+            limit=20,
+        )
 
         if artwork_release_ids:
             return {
@@ -2166,7 +2187,7 @@ def choose_musicbrainz_release(
                 release_id
             )
 
-        if len(artwork_release_ids) >= 15:
+        if len(artwork_release_ids) >= 40:
             break
 
     # Release-group siblings are preferred over broad title-only searches
@@ -2174,7 +2195,7 @@ def choose_musicbrainz_release(
     for release_id in release_group_artwork_ids:
         if release_id and release_id not in artwork_release_ids:
             artwork_release_ids.append(release_id)
-        if len(artwork_release_ids) >= 15:
+        if len(artwork_release_ids) >= 40:
             break
 
     # Finally use direct album-release searches as a secondary artwork source.
@@ -2198,7 +2219,7 @@ def choose_musicbrainz_release(
                 release_id
             )
 
-        if len(artwork_release_ids) >= 15:
+        if len(artwork_release_ids) >= 40:
             break
 
     # Final safety check: a release with the same/similar name is not enough.
@@ -2209,8 +2230,7 @@ def choose_musicbrainz_release(
         limit=15,
     )
 
-    if verified_ids:
-        artwork_release_ids = verified_ids
+    artwork_release_ids = verified_ids
 
     best["artwork_release_ids"] = artwork_release_ids
 
