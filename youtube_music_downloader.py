@@ -49,7 +49,7 @@ FFMPEG = os.path.join(
     "ffmpeg.exe",
 )
 
-DEFAULT_DESTINATION_FOLDER = "Andy Music"
+DEFAULT_DESTINATION_FOLDER = "Recent Downloads"
 
 MUSICBRAINZ_USER_AGENT = "AndyMusicDownloader/3.0"
 MUSICBRAINZ_DELAY = 1.0
@@ -231,13 +231,13 @@ class DownloadReport:
         )
 
         try:
+            # Rewrite the report instead of appending a new copy on every
+            # item. This keeps exactly one report and one Summary section.
             with open(
                 report_file,
-                "a",
+                "w",
                 encoding="utf-8",
             ) as file:
-
-                file.write("\n")
                 file.write(
                     "============================================================\n"
                 )
@@ -1099,6 +1099,18 @@ def release_candidates(recording):
                     "status",
                     "",
                 ),
+                "country": release.get(
+                    "country",
+                    "",
+                ),
+                "language": release.get(
+                    "language",
+                    "",
+                ),
+                "script": release.get(
+                    "script",
+                    "",
+                ),
                 "track_count": release.get(
                     "track-count",
                     0,
@@ -1600,10 +1612,63 @@ def search_releases_for_artwork(meta):
                         or group.get("first-release-date", "")
                     ),
                     "status": release.get("status", ""),
+                    "country": release.get("country", "") or "",
+                    "language": release.get("language", "") or "",
+                    "script": release.get("script", "") or "",
                 }
             )
 
     return results
+
+def artwork_locale_tier(release):
+    """Return a strict locale preference tier for artwork.
+
+    4 = English + US
+    3 = English + another country
+    2 = US + another language
+    1 = other / unspecified
+    """
+    country = normalize_text(release.get("country", ""))
+    language = normalize_text(release.get("language", ""))
+    is_us = country in {"us", "usa", "united states"}
+    is_english = language in {"eng", "english"}
+
+    if is_english and is_us:
+        return 4
+    if is_english:
+        return 3
+    if is_us:
+        return 2
+    return 1
+
+
+def artwork_locale_score(release):
+    """Prefer English-language US releases for album artwork.
+
+    MusicBrainz can contain many valid releases of the same album: US, UK,
+    Japanese, European, translated, and other regional editions. For cover
+    art we prefer an English (US) release, then English releases elsewhere,
+    then US releases in another language, and finally other releases.
+    """
+    country = normalize_text(release.get("country", ""))
+    language = normalize_text(release.get("language", ""))
+    script = normalize_text(release.get("script", ""))
+
+    score = 0
+
+    # MusicBrainz uses ISO-style codes here: US / eng / Latn.
+    if language in {"eng", "english"}:
+        score += 10000
+    if country in {"us", "usa", "united states"}:
+        score += 8000
+
+    # Latin script is a useful tie-breaker, but language remains the stronger
+    # preference. Do not require it because some records omit script.
+    if script in {"latn", "latin"}:
+        score += 500
+
+    return score
+
 
 def artwork_release_score(release, meta):
     """Score an album release specifically for artwork use."""
@@ -1618,6 +1683,10 @@ def artwork_release_score(release, meta):
     }
 
     score += artist_affinity(meta.get("artist", ""), artist)
+
+    # Prefer English (US) releases when several valid releases have the same
+    # album identity and requested recording.
+    score += artwork_locale_score(release)
 
     if same_text(meta.get("album"), album):
         score += 7000
@@ -1688,6 +1757,10 @@ def recording_artwork_score(candidate, meta):
     wanted_title = meta.get("title", "")
     wanted_artist = meta.get("artist", "")
     wanted_album = meta.get("album", "")
+
+    # Locale is only a ranking preference. The later verification step still
+    # requires the release to match the requested album and contain the song.
+    score += artwork_locale_score(release)
 
     if same_text(wanted_title, recording_title):
         score += 12000
@@ -1842,6 +1915,9 @@ def release_group_artwork_candidates(choices, meta, limit=20):
                 "secondary_types": secondary,
                 "date": release.get("date", "") or group.get("first-release-date", ""),
                 "status": release.get("status", ""),
+                "country": release.get("country", "") or "",
+                "language": release.get("language", "") or "",
+                "script": release.get("script", "") or "",
                 "release_group_id": group_id,
             }
             if meta.get("album") and not strict_artwork_album_match(
@@ -1911,13 +1987,36 @@ def verify_artwork_releases(release_ids, meta, limit=15):
             "secondary_types": group.get("secondary-types", []) or [],
             "date": release.get("date", ""),
             "status": release.get("status", ""),
+            "country": release.get("country", "") or "",
+            "language": release.get("language", "") or "",
+            "script": release.get("script", "") or "",
         })
 
-        if len(verified) >= limit:
-            break
+    # Do not stop before sorting. A Japanese/UK release can appear early in
+    # the MusicBrainz results while the preferred English/US release appears
+    # later. Every candidate must be verified before locale preference is
+    # applied.
 
-    verified.sort(key=lambda x: -artwork_release_score(x, meta))
-    return [x["release_id"] for x in verified]
+    verified.sort(
+        key=lambda x: (
+            -artwork_locale_tier(x),
+            -artwork_release_score(x, meta),
+            normalize_text(x.get("album", "")),
+        )
+    )
+
+    # Prefer the highest locale tier that actually exists. In particular, if
+    # an English/US release is available, do not fall back to Japanese, UK,
+    # or another regional release merely because it appeared earlier.
+    if verified:
+        best_tier = artwork_locale_tier(verified[0])
+        verified = [
+            x
+            for x in verified
+            if artwork_locale_tier(x) == best_tier
+        ]
+
+    return [x["release_id"] for x in verified[:limit]]
 
 
 def choose_musicbrainz_release(
@@ -2128,8 +2227,8 @@ def choose_musicbrainz_release(
         artwork_release_ids = verify_artwork_releases(
             artwork_release_ids,
             meta,
-            limit=20,
-        )
+            limit=40,
+        )[:15]
 
         if artwork_release_ids:
             return {
@@ -2223,12 +2322,14 @@ def choose_musicbrainz_release(
             break
 
     # Final safety check: a release with the same/similar name is not enough.
-    # It must actually contain the requested recording.
+    # It must actually contain the requested recording. Locale preference is
+    # applied only after this validation, so a US/English release can never
+    # win merely because it is US/English if it is the wrong album or track.
     verified_ids = verify_artwork_releases(
         artwork_release_ids,
         meta,
-        limit=15,
-    )
+        limit=40,
+    )[:15]
 
     artwork_release_ids = verified_ids
 
