@@ -1037,6 +1037,19 @@ def mb_search(
     return request_json(url)
 
 
+def mb_lookup(entity, mbid, includes=""):
+    """Look up a specific MusicBrainz entity by MBID."""
+    if not mbid:
+        return None
+    url = (
+        "https://musicbrainz.org/ws/2/"
+        f"{entity}/{urllib.parse.quote(mbid)}?fmt=json"
+    )
+    if includes:
+        url += "&inc=" + urllib.parse.quote(includes, safe="+")
+    return request_json(url)
+
+
 def release_candidates(recording):
     result = []
 
@@ -1784,6 +1797,114 @@ def recording_artwork_candidates(choices, meta, limit=15):
     ]
 
 
+def release_group_artwork_candidates(choices, meta, limit=20):
+    """Find artwork from releases in the matched recording's release groups.
+
+    A recording can have a single, an album release, a compilation, and
+    regional/edition releases. The correct artwork is often a sibling
+    release rather than the first release returned by a recording search.
+    """
+    group_ids = []
+    seen_groups = set()
+
+    for candidate in choices:
+        release = candidate.get("release", {}) or {}
+        group_id = release.get("release_group_id", "")
+        if group_id and group_id not in seen_groups:
+            seen_groups.add(group_id)
+            group_ids.append(group_id)
+
+    ranked = []
+    seen_releases = set()
+
+    for group_id in group_ids[:20]:
+        print(f"MusicBrainz artwork lookup (release group): {group_id}")
+        group = mb_lookup("release-group", group_id, "releases+artist-credits")
+        if not group:
+            continue
+
+        group_artist = artist_credit_to_string(group.get("artist-credit", []))
+        primary = group.get("primary-type", "") or ""
+        secondary = group.get("secondary-types", []) or []
+
+        for release in group.get("releases", []) or []:
+            release_id = release.get("id", "")
+            if not release_id or release_id in seen_releases:
+                continue
+
+            item = {
+                "release_id": release_id,
+                "album": release.get("title", ""),
+                "artist": artist_credit_to_string(release.get("artist-credit", [])) or group_artist,
+                "primary_type": primary,
+                "secondary_types": secondary,
+                "date": release.get("date", "") or group.get("first-release-date", ""),
+                "status": release.get("status", ""),
+                "release_group_id": group_id,
+            }
+            score = artwork_release_score(item, meta) + 800
+            if score > 0:
+                seen_releases.add(release_id)
+                ranked.append((score, item))
+
+    ranked.sort(key=lambda x: (-x[0], normalize_text(x[1].get("album", ""))))
+    return [x[1]["release_id"] for x in ranked[:limit]]
+
+
+def release_contains_requested_recording(release, meta):
+    """Return True only if the release actually contains the requested track."""
+    wanted_title = normalize_text(meta.get("title", ""))
+    wanted_artist = meta.get("artist", "")
+    if not wanted_title:
+        return False
+
+    for medium in release.get("media", []) or []:
+        for track in medium.get("tracks", []) or []:
+            recording = track.get("recording", {}) or {}
+            title = recording.get("title", "")
+            if not (same_text(wanted_title, title) or loose_text(wanted_title, title)):
+                continue
+
+            recording_artist = artist_credit_to_string(recording.get("artist-credit", []))
+            if not wanted_artist or artist_affinity(wanted_artist, recording_artist) > 0:
+                return True
+
+    return False
+
+
+def verify_artwork_releases(release_ids, meta, limit=15):
+    """Remove same-name releases that do not actually contain the song."""
+    verified = []
+
+    for release_id in release_ids:
+        if not release_id:
+            continue
+
+        release = get_release_details(release_id)
+        if not release:
+            continue
+
+        if not release_contains_requested_recording(release, meta):
+            continue
+
+        group = release.get("release-group", {}) or {}
+        verified.append({
+            "release_id": release_id,
+            "album": release.get("title", ""),
+            "artist": artist_credit_to_string(release.get("artist-credit", [])),
+            "primary_type": group.get("primary-type", "") or "",
+            "secondary_types": group.get("secondary-types", []) or [],
+            "date": release.get("date", ""),
+            "status": release.get("status", ""),
+        })
+
+        if len(verified) >= limit:
+            break
+
+    verified.sort(key=lambda x: -artwork_release_score(x, meta))
+    return [x["release_id"] for x in verified]
+
+
 def choose_musicbrainz_release(
     recordings,
     meta,
@@ -1865,6 +1986,14 @@ def choose_musicbrainz_release(
         choices,
         meta,
         limit=15,
+    )
+
+    # Look beyond the first release attached to the recording. The same
+    # recording often appears on a single and on the actual album release.
+    release_group_artwork_ids = release_group_artwork_candidates(
+        choices,
+        meta,
+        limit=20,
     )
 
     if not choices:
@@ -1961,6 +2090,10 @@ def choose_musicbrainz_release(
             if release_id not in artwork_release_ids:
                 artwork_release_ids.append(release_id)
 
+        for release_id in release_group_artwork_ids:
+            if release_id and release_id not in artwork_release_ids:
+                artwork_release_ids.append(release_id)
+
         for release in artwork_releases:
             release_id = release.get(
                 "release_id",
@@ -2036,7 +2169,15 @@ def choose_musicbrainz_release(
         if len(artwork_release_ids) >= 15:
             break
 
-    # Then use direct album-release searches as a secondary artwork source.
+    # Release-group siblings are preferred over broad title-only searches
+    # because they remain connected to the matched recording.
+    for release_id in release_group_artwork_ids:
+        if release_id and release_id not in artwork_release_ids:
+            artwork_release_ids.append(release_id)
+        if len(artwork_release_ids) >= 15:
+            break
+
+    # Finally use direct album-release searches as a secondary artwork source.
     artwork_releases = search_releases_for_artwork(meta)
     artwork_releases.sort(
         key=lambda x: -artwork_release_score(x, meta)
@@ -2059,6 +2200,17 @@ def choose_musicbrainz_release(
 
         if len(artwork_release_ids) >= 15:
             break
+
+    # Final safety check: a release with the same/similar name is not enough.
+    # It must actually contain the requested recording.
+    verified_ids = verify_artwork_releases(
+        artwork_release_ids,
+        meta,
+        limit=15,
+    )
+
+    if verified_ids:
+        artwork_release_ids = verified_ids
 
     best["artwork_release_ids"] = artwork_release_ids
 
