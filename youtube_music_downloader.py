@@ -24,8 +24,7 @@ from mutagen.id3 import (
     APIC,
 )
 from mutagen.mp3 import MP3
-from mutagen.flac import FLAC
-from mutagen.mp4 import MP4, MP4Cover
+from mutagen.flac import FLAC, Picture
 
 
 # ============================================================
@@ -50,6 +49,11 @@ FFMPEG = os.path.join(
     SCRIPT_DIRECTORY,
     "ffmpeg.exe",
 )
+
+# Final M4A settings. FFmpeg's native AAC encoder is used at its
+# high-bitrate limit for a high-quality M4A output.
+M4A_BITRATE = "512k"
+KEEP_FLAC = False
 
 DEFAULT_DESTINATION_FOLDER = "Recent Downloads"
 
@@ -2986,106 +2990,57 @@ def find_existing_song(
     meta,
 ):
     wanted = (
-        normalize_text(
-            meta.get("title")
-        ),
-        normalize_text(
-            meta.get("artist")
-        ),
-        normalize_text(
-            meta.get("album")
-        ),
+        normalize_text(meta.get("title")),
+        normalize_text(meta.get("artist")),
+        normalize_text(meta.get("album")),
     )
 
     if not all(wanted):
         return None
 
     try:
-        names = os.listdir(
-            folder
-        )
-
+        names = os.listdir(folder)
     except OSError:
         return None
 
     for name in names:
-        if not name.lower().endswith(
-            (".m4a", ".flac", ".mp3")
-        ):
+        if not name.lower().endswith((".m4a", ".flac", ".mp3")):
             continue
 
-        path = os.path.join(
-            folder,
-            name,
-        )
+        path = os.path.join(folder, name)
 
         try:
-            if name.lower().endswith(".m4a"):
-                audio = MP4(path)
-
-                if not audio.tags:
-                    continue
-
-                got = (
-                    normalize_text(
-                        audio.get("\xa9nam", [""])[0]
-                    ),
-                    normalize_text(
-                        audio.get("\xa9ART", [""])[0]
-                    ),
-                    normalize_text(
-                        audio.get("\xa9alb", [""])[0]
-                    ),
-                )
-
-            elif name.lower().endswith(".flac"):
+            if name.lower().endswith(".flac"):
                 audio = FLAC(path)
-
                 if not audio.tags:
                     continue
-
                 got = (
-                    normalize_text(
-                        audio.get("title", [""])[0]
-                    ),
-                    normalize_text(
-                        audio.get("artist", [""])[0]
-                    ),
-                    normalize_text(
-                        audio.get("album", [""])[0]
-                    ),
+                    normalize_text(audio.get("title", [""])[0]),
+                    normalize_text(audio.get("artist", [""])[0]),
+                    normalize_text(audio.get("album", [""])[0]),
                 )
-
+            elif name.lower().endswith(".m4a"):
+                from mutagen.mp4 import MP4
+                audio = MP4(path)
+                if not audio.tags:
+                    continue
+                got = (
+                    normalize_text((audio.tags.get("\xa9nam") or [""])[0]),
+                    normalize_text((audio.tags.get("\xa9ART") or [""])[0]),
+                    normalize_text((audio.tags.get("\xa9alb") or [""])[0]),
+                )
             else:
                 audio = MP3(path)
-
                 if not audio.tags:
                     continue
-
                 got = (
-                    normalize_text(
-                        id3_text(
-                            audio.tags,
-                            "TIT2",
-                        )
-                    ),
-                    normalize_text(
-                        id3_text(
-                            audio.tags,
-                            "TPE1",
-                        )
-                    ),
-                    normalize_text(
-                        id3_text(
-                            audio.tags,
-                            "TALB",
-                        )
-                    ),
+                    normalize_text(id3_text(audio.tags, "TIT2")),
+                    normalize_text(id3_text(audio.tags, "TPE1")),
+                    normalize_text(id3_text(audio.tags, "TALB")),
                 )
 
             if got == wanted:
                 return path
-
         except Exception:
             pass
 
@@ -3233,83 +3188,144 @@ def download_cover_art(
     return None, "unavailable"
 
 def embed_metadata(
-    m4a_file,
+    flac_file,
     meta,
     artwork_file,
 ):
     try:
-        audio = MP4(m4a_file)
+        audio = FLAC(flac_file)
 
-        # Remove the fields this downloader controls so rerunning/tagging
-        # always produces a clean, predictable metadata set.
         for field in [
-            "\xa9nam",
-            "\xa9ART",
-            "aART",
-            "\xa9alb",
-            "\xa9day",
-            "trkn",
-            "\xa9gen",
-            "----:com.apple.iTunes:ISRC",
-            "covr",
+            "title", "artist", "album", "albumartist",
+            "date", "tracknumber", "genre", "isrc",
         ]:
             audio.pop(field, None)
 
-        audio["\xa9nam"] = [meta["title"]]
-        audio["\xa9ART"] = [meta["artist"]]
-        audio["aART"] = [
-            meta.get("album_artist")
-            or meta["artist"]
-        ]
-        audio["\xa9alb"] = [meta["album"]]
+        audio["title"] = meta["title"]
+        audio["artist"] = meta["artist"]
+        audio["albumartist"] = meta.get("album_artist") or meta["artist"]
+        audio["album"] = meta["album"]
 
         if meta.get("year"):
-            audio["\xa9day"] = [str(meta["year"])]
-
+            audio["date"] = str(meta["year"])
         if meta.get("track"):
-            audio["trkn"] = [(int(meta["track"]), 0)]
-
+            audio["tracknumber"] = str(meta["track"])
         if meta.get("genre"):
-            audio["\xa9gen"] = [meta["genre"]]
-
+            audio["genre"] = meta["genre"]
         if meta.get("isrc"):
-            audio["----:com.apple.iTunes:ISRC"] = [
-                meta["isrc"].encode("utf-8")
-            ]
+            audio["isrc"] = meta["isrc"]
 
-        # Replace existing embedded artwork so the selected Cover Art
-        # Archive artwork is the only cover in the ALAC/M4A file.
-        if (
-            artwork_file
-            and os.path.isfile(
-                artwork_file
-            )
-        ):
-            with open(
-                artwork_file,
-                "rb",
-            ) as file:
+        audio.clear_pictures()
+
+        if artwork_file and os.path.isfile(artwork_file):
+            with open(artwork_file, "rb") as file:
                 image_data = file.read()
-
-            audio["covr"] = [
-                MP4Cover(
-                    image_data,
-                    imageformat=MP4Cover.FORMAT_JPEG,
-                )
-            ]
+            picture = Picture()
+            picture.type = 3
+            picture.mime = "image/jpeg"
+            picture.desc = "Cover"
+            picture.data = image_data
+            audio.add_picture(picture)
 
         audio.save()
-
         return True, ""
 
     except Exception as error:
-        print(
-            "ERROR: Could not embed metadata:"
-        )
-
+        print("ERROR: Could not embed FLAC metadata:")
         print(error)
-
         return False, str(error)
+
+
+def embed_m4a_metadata(
+    m4a_file,
+    meta,
+    artwork_file,
+):
+    """Write the downloader's metadata and artwork into the final M4A."""
+    try:
+        from mutagen.mp4 import MP4, MP4Cover
+
+        audio = MP4(m4a_file)
+        if audio.tags is None:
+            audio.add_tags()
+        tags = audio.tags
+
+        tags["\xa9nam"] = [str(meta.get("title") or "")]
+        tags["\xa9ART"] = [str(meta.get("artist") or "")]
+        tags["aART"] = [str(meta.get("album_artist") or meta.get("artist") or "")]
+        tags["\xa9alb"] = [str(meta.get("album") or "")]
+
+        if meta.get("year"):
+            tags["\xa9day"] = [str(meta["year"])]
+        if meta.get("genre"):
+            tags["\xa9gen"] = [str(meta["genre"])]
+
+        if meta.get("track"):
+            try:
+                parts = str(meta["track"]).split("/", 1)
+                track_number = int(parts[0])
+                total_tracks = int(parts[1]) if len(parts) == 2 else 0
+                tags["trkn"] = [(track_number, total_tracks)]
+            except (TypeError, ValueError):
+                pass
+
+        if meta.get("isrc"):
+            tags["----:com.apple.iTunes:ISRC"] = [str(meta["isrc"]).encode("utf-8")]
+
+        if artwork_file and os.path.isfile(artwork_file):
+            with open(artwork_file, "rb") as file:
+                image_data = file.read()
+            tags["covr"] = [MP4Cover(image_data, imageformat=MP4Cover.FORMAT_JPEG)]
+
+        audio.save()
+        return True, ""
+
+    except Exception as error:
+        print("ERROR: Could not embed M4A metadata:")
+        print(error)
+        return False, str(error)
+
+
+def convert_flac_to_m4a(
+    flac_file,
+    m4a_file,
+):
+    """Convert the completed FLAC to high-bitrate AAC in an M4A container."""
+    print()
+    print("Converting FLAC to M4A...")
+    print(f"  AAC bitrate: {M4A_BITRATE}")
+
+    try:
+        result = subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-loglevel", "error",
+                "-y",
+                "-i", flac_file,
+                "-map", "0:a:0",
+                "-vn",
+                "-c:a", "aac",
+                "-b:a", M4A_BITRATE,
+                "-movflags", "+faststart",
+                m4a_file,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        print("ERROR: ffmpeg.exe was not found.")
+        return False, "ffmpeg.exe was not found"
+
+    if result.returncode != 0 or not os.path.isfile(m4a_file):
+        print("ERROR: FFmpeg failed to create the M4A.")
+        if result.stderr:
+            print(result.stderr.strip())
+        return False, result.stderr.strip() if result.stderr else "FFmpeg failed to create the M4A"
+
+    return True, ""
 
 
 # ============================================================
@@ -3321,19 +3337,17 @@ def download_track(
     meta,
     folder,
 ):
-    # yt-dlp's audio postprocessor adds the ALAC container extension
-    # itself.  Pass it the filename without an extension so it creates
-    # Song.m4a instead of Song.m4a.m4a.
-    filename = safe_filename(
-        meta["title"]
+    filename = (
+        safe_filename(
+            meta["title"]
+        )
+        + ".flac"
     )
 
-    output_base = os.path.join(
+    output = os.path.join(
         folder,
         filename,
     )
-
-    output = output_base + ".m4a"
 
     if os.path.isfile(
         output
@@ -3356,7 +3370,7 @@ def download_track(
 
     print()
     print(
-        "Downloading ALAC..."
+        "Downloading FLAC..."
     )
     print()
 
@@ -3364,18 +3378,15 @@ def download_track(
         result = run_ytdlp(
             ytdlp_args()
             + [
-                # Select the best audio source available.
-                # ALAC itself is lossless; the source stream determines
-                # the actual audio quality.
-                "-f",
-                "bestaudio",
                 "-x",
                 "--audio-format",
-                "alac",
+                "flac",
+                "--audio-quality",
+                "0",
                 "--ffmpeg-location",
                 FFMPEG,
                 "-o",
-                output_base,
+                output,
                 url,
             ]
         )
@@ -3395,7 +3406,7 @@ def download_track(
     ):
         print(
             "ERROR: yt-dlp failed or "
-            "the ALAC file was not created."
+            "the FLAC was not created."
         )
 
         error_type = classify_ytdlp_error(
@@ -3565,7 +3576,7 @@ def process_item(
             or youtube.get("title")
             or "Unknown"
         )
-        + ".m4a"
+        + ".flac"
     )
 
     if differences:
@@ -3702,10 +3713,10 @@ def process_item(
         return False
 
     # --------------------------------------------------------
-    # Download ALAC
+    # Download FLAC
     # --------------------------------------------------------
 
-    m4a, download_status = (
+    flac, download_status = (
         download_track(
             url,
             final,
@@ -3713,7 +3724,7 @@ def process_item(
         )
     )
 
-    if not m4a:
+    if not flac:
         if download_status == "filename_conflict":
             report.add(
                 "filename_conflicts",
@@ -3753,7 +3764,7 @@ def process_item(
             report.add(
                 "audio_errors",
                 filename,
-                "yt-dlp/FFmpeg failed to create the ALAC",
+                "yt-dlp/FFmpeg failed to create the FLAC",
             )
 
         return False
@@ -3776,7 +3787,7 @@ def process_item(
     if artwork_status == "unavailable":
         report.add(
             "artwork_unavailable",
-            os.path.basename(m4a),
+            os.path.basename(flac),
             "No album artwork was found",
         )
         warning = True
@@ -3784,7 +3795,7 @@ def process_item(
     elif artwork_status == "error":
         report.add(
             "artwork_errors",
-            os.path.basename(m4a),
+            os.path.basename(flac),
             "Cover Art Archive request failed",
         )
         warning = True
@@ -3792,7 +3803,7 @@ def process_item(
     elif artwork_status == "file":
         report.add(
             "file_errors",
-            os.path.basename(m4a),
+            os.path.basename(flac),
             "Could not save album artwork",
         )
         warning = True
@@ -3803,7 +3814,7 @@ def process_item(
 
     tagging_success, tagging_error = (
         embed_metadata(
-            m4a,
+            flac,
             final,
             artwork,
         )
@@ -3830,8 +3841,8 @@ def process_item(
     if not tagging_success:
         report.add(
             "metadata_errors",
-            os.path.basename(m4a),
-            "Could not embed MP4/ALAC metadata"
+            os.path.basename(flac),
+            "Could not embed ID3 metadata"
             + (
                 f": {tagging_error}"
                 if tagging_error
@@ -3842,68 +3853,85 @@ def process_item(
         return False
 
     # --------------------------------------------------------
-    # Finished
+    # Convert FLAC to final M4A
     # --------------------------------------------------------
+
+    m4a_filename = (
+        safe_filename(final.get("title") or youtube.get("title") or "Unknown")
+        + ".m4a"
+    )
+    m4a_path = os.path.join(folder, m4a_filename)
+
+    if os.path.isfile(m4a_path):
+        print("ERROR: The final M4A filename already exists.")
+        report.add("filename_conflicts", m4a_filename, "Final M4A filename already exists")
+        return False
+
+    conversion_success, conversion_error = convert_flac_to_m4a(flac, m4a_path)
+
+    if not conversion_success:
+        report.add(
+            "audio_errors",
+            os.path.basename(flac),
+            "Could not convert FLAC to M4A" + (f": {conversion_error}" if conversion_error else ""),
+        )
+        return False
+
+    # Apply the same metadata and artwork to the final M4A.
+    m4a_tagging_success, m4a_tagging_error = embed_m4a_metadata(
+        m4a_path, final, artwork
+    )
+
+    if not m4a_tagging_success:
+        report.add(
+            "metadata_errors",
+            m4a_filename,
+            "Could not embed M4A metadata" + (f": {m4a_tagging_error}" if m4a_tagging_error else ""),
+        )
+        try:
+            os.remove(m4a_path)
+        except OSError:
+            pass
+        return False
+
+    # Delete temporary artwork.
+    if artwork and os.path.isfile(artwork):
+        try:
+            os.remove(artwork)
+        except OSError:
+            pass
+
+    # Delete the intermediate FLAC unless KEEP_FLAC is changed to True above.
+    if not KEEP_FLAC:
+        try:
+            os.remove(flac)
+        except OSError as error:
+            print("WARNING: The temporary FLAC could not be deleted.")
+            print(error)
+            warning = True
 
     print()
-    print(
-        "Finished:"
-    )
-
-    print(
-        f"  Artist:       "
-        f"{final['artist']}"
-    )
-
-    print(
-        f"  Album:        "
-        f"{final['album']}"
-    )
-
-    print(
-        f"  Song:         "
-        f"{final['title']}"
-    )
-
-    print(
-        f"  Album Artist: "
-        f"{final.get('album_artist', '')}"
-    )
-
-    print(
-        f"  Year:         "
-        f"{final.get('year', '')}"
-    )
-
-    print(
-        f"  Track:        "
-        f"{final.get('track', '')}"
-    )
-
-    print(
-        f"  File:         "
-        f"{os.path.basename(m4a)}"
-    )
-
-    # --------------------------------------------------------
-    # Report success/warning
-    # --------------------------------------------------------
+    print("Finished:")
+    print(f"  Artist:       {final['artist']}")
+    print(f"  Album:        {final['album']}")
+    print(f"  Song:         {final['title']}")
+    print(f"  Album Artist: {final.get('album_artist', '')}")
+    print(f"  Year:         {final.get('year', '')}")
+    print(f"  Track:        {final.get('track', '')}")
+    print(f"  AAC bitrate:  {M4A_BITRATE}")
+    print(f"  File:         {m4a_filename}")
 
     if warning:
         report.add(
             "completed_with_warnings",
-            os.path.basename(m4a),
-            "Audio and metadata completed, "
-            "but album artwork was unavailable or failed",
+            m4a_filename,
+            "M4A completed, but the temporary FLAC could not be deleted",
         )
-
     else:
-        report.add(
-            "successful",
-            os.path.basename(m4a),
-        )
+        report.add("successful", m4a_filename)
 
     return True
+
 
 
 # ============================================================
