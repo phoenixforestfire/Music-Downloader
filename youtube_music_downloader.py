@@ -24,6 +24,7 @@ from mutagen.id3 import (
     APIC,
 )
 from mutagen.mp3 import MP3
+from mutagen.flac import FLAC, Picture
 
 
 # ============================================================
@@ -3008,7 +3009,7 @@ def find_existing_song(
 
     for name in names:
         if not name.lower().endswith(
-            ".mp3"
+            (".flac", ".mp3")
         ):
             continue
 
@@ -3018,31 +3019,50 @@ def find_existing_song(
         )
 
         try:
-            audio = MP3(path)
+            if name.lower().endswith(".flac"):
+                audio = FLAC(path)
 
-            if not audio.tags:
-                continue
+                if not audio.tags:
+                    continue
 
-            got = (
-                normalize_text(
-                    id3_text(
-                        audio.tags,
-                        "TIT2",
-                    )
-                ),
-                normalize_text(
-                    id3_text(
-                        audio.tags,
-                        "TPE1",
-                    )
-                ),
-                normalize_text(
-                    id3_text(
-                        audio.tags,
-                        "TALB",
-                    )
-                ),
-            )
+                got = (
+                    normalize_text(
+                        audio.get("title", [""])[0]
+                    ),
+                    normalize_text(
+                        audio.get("artist", [""])[0]
+                    ),
+                    normalize_text(
+                        audio.get("album", [""])[0]
+                    ),
+                )
+
+            else:
+                audio = MP3(path)
+
+                if not audio.tags:
+                    continue
+
+                got = (
+                    normalize_text(
+                        id3_text(
+                            audio.tags,
+                            "TIT2",
+                        )
+                    ),
+                    normalize_text(
+                        id3_text(
+                            audio.tags,
+                            "TPE1",
+                        )
+                    ),
+                    normalize_text(
+                        id3_text(
+                            audio.tags,
+                            "TALB",
+                        )
+                    ),
+                )
 
             if got == wanted:
                 return path
@@ -3194,102 +3214,54 @@ def download_cover_art(
     return None, "unavailable"
 
 def embed_metadata(
-    mp3_file,
+    flac_file,
     meta,
     artwork_file,
 ):
     try:
-        try:
-            tags = ID3(
-                mp3_file
-            )
+        audio = FLAC(flac_file)
 
-        except ID3NoHeaderError:
-            tags = ID3()
-
-        for frame in [
-            "TIT2",
-            "TPE1",
-            "TPE2",
-            "TALB",
-            "TDRC",
-            "TRCK",
-            "TCON",
-            "TSRC",
-            "APIC",
+        # Remove the fields this downloader controls so rerunning/tagging
+        # always produces a clean, predictable metadata set.
+        for field in [
+            "title",
+            "artist",
+            "album",
+            "albumartist",
+            "date",
+            "tracknumber",
+            "genre",
+            "isrc",
         ]:
-            tags.delall(
-                frame
-            )
+            audio.pop(field, None)
 
-        tags.add(
-            TIT2(
-                encoding=3,
-                text=meta["title"],
-            )
+        audio["title"] = meta["title"]
+        audio["artist"] = meta["artist"]
+        audio["albumartist"] = (
+            meta.get("album_artist")
+            or meta["artist"]
         )
-
-        tags.add(
-            TPE1(
-                encoding=3,
-                text=meta["artist"],
-            )
-        )
-
-        tags.add(
-            TPE2(
-                encoding=3,
-                text=(
-                    meta.get(
-                        "album_artist"
-                    )
-                    or meta["artist"]
-                ),
-            )
-        )
-
-        tags.add(
-            TALB(
-                encoding=3,
-                text=meta["album"],
-            )
-        )
+        audio["album"] = meta["album"]
 
         if meta.get("year"):
-            tags.add(
-                TDRC(
-                    encoding=3,
-                    text=str(
-                        meta["year"]
-                    ),
-                )
+            audio["date"] = str(
+                meta["year"]
             )
 
         if meta.get("track"):
-            tags.add(
-                TRCK(
-                    encoding=3,
-                    text=str(
-                        meta["track"]
-                    ),
-                )
+            audio["tracknumber"] = str(
+                meta["track"]
             )
 
         if meta.get("genre"):
-            tags.add(
-                TCON(
-                    encoding=3,
-                    text=meta["genre"],
-                )
-            )
+            audio["genre"] = meta["genre"]
 
         if meta.get("isrc"):
-            tags.add(
-                TSRC(
-                    encoding=3,
-                    text=meta["isrc"],
-                )
-            )
+            audio["isrc"] = meta["isrc"]
+
+        # Replace existing embedded pictures so the selected Cover Art
+        # Archive artwork is the only cover in the FLAC file.
+        audio.clear_pictures()
 
         if (
             artwork_file
@@ -3303,20 +3275,14 @@ def embed_metadata(
             ) as file:
                 image_data = file.read()
 
-            tags.add(
-                APIC(
-                    encoding=3,
-                    mime="image/jpeg",
-                    type=3,
-                    desc="Cover",
-                    data=image_data,
-                )
-            )
+            picture = Picture()
+            picture.type = 3
+            picture.mime = "image/jpeg"
+            picture.desc = "Cover"
+            picture.data = image_data
+            audio.add_picture(picture)
 
-        tags.save(
-            mp3_file,
-            v2_version=3,
-        )
+        audio.save()
 
         return True, ""
 
@@ -3343,7 +3309,7 @@ def download_track(
         safe_filename(
             meta["title"]
         )
-        + ".mp3"
+        + ".flac"
     )
 
     output = os.path.join(
@@ -3372,7 +3338,7 @@ def download_track(
 
     print()
     print(
-        "Downloading MP3..."
+        "Downloading FLAC..."
     )
     print()
 
@@ -3382,7 +3348,7 @@ def download_track(
             + [
                 "-x",
                 "--audio-format",
-                "mp3",
+                "flac",
                 "--audio-quality",
                 "0",
                 "--ffmpeg-location",
@@ -3408,7 +3374,7 @@ def download_track(
     ):
         print(
             "ERROR: yt-dlp failed or "
-            "the MP3 was not created."
+            "the FLAC was not created."
         )
 
         error_type = classify_ytdlp_error(
@@ -3578,7 +3544,7 @@ def process_item(
             or youtube.get("title")
             or "Unknown"
         )
-        + ".mp3"
+        + ".flac"
     )
 
     if differences:
@@ -3715,10 +3681,10 @@ def process_item(
         return False
 
     # --------------------------------------------------------
-    # Download MP3
+    # Download FLAC
     # --------------------------------------------------------
 
-    mp3, download_status = (
+    flac, download_status = (
         download_track(
             url,
             final,
@@ -3726,7 +3692,7 @@ def process_item(
         )
     )
 
-    if not mp3:
+    if not flac:
         if download_status == "filename_conflict":
             report.add(
                 "filename_conflicts",
@@ -3766,7 +3732,7 @@ def process_item(
             report.add(
                 "audio_errors",
                 filename,
-                "yt-dlp/FFmpeg failed to create the MP3",
+                "yt-dlp/FFmpeg failed to create the FLAC",
             )
 
         return False
@@ -3789,7 +3755,7 @@ def process_item(
     if artwork_status == "unavailable":
         report.add(
             "artwork_unavailable",
-            os.path.basename(mp3),
+            os.path.basename(flac),
             "No album artwork was found",
         )
         warning = True
@@ -3797,7 +3763,7 @@ def process_item(
     elif artwork_status == "error":
         report.add(
             "artwork_errors",
-            os.path.basename(mp3),
+            os.path.basename(flac),
             "Cover Art Archive request failed",
         )
         warning = True
@@ -3805,7 +3771,7 @@ def process_item(
     elif artwork_status == "file":
         report.add(
             "file_errors",
-            os.path.basename(mp3),
+            os.path.basename(flac),
             "Could not save album artwork",
         )
         warning = True
@@ -3816,7 +3782,7 @@ def process_item(
 
     tagging_success, tagging_error = (
         embed_metadata(
-            mp3,
+            flac,
             final,
             artwork,
         )
@@ -3843,7 +3809,7 @@ def process_item(
     if not tagging_success:
         report.add(
             "metadata_errors",
-            os.path.basename(mp3),
+            os.path.basename(flac),
             "Could not embed ID3 metadata"
             + (
                 f": {tagging_error}"
@@ -3895,7 +3861,7 @@ def process_item(
 
     print(
         f"  File:         "
-        f"{os.path.basename(mp3)}"
+        f"{os.path.basename(flac)}"
     )
 
     # --------------------------------------------------------
@@ -3905,7 +3871,7 @@ def process_item(
     if warning:
         report.add(
             "completed_with_warnings",
-            os.path.basename(mp3),
+            os.path.basename(flac),
             "Audio and metadata completed, "
             "but album artwork was unavailable or failed",
         )
@@ -3913,7 +3879,7 @@ def process_item(
     else:
         report.add(
             "successful",
-            os.path.basename(mp3),
+            os.path.basename(flac),
         )
 
     return True
