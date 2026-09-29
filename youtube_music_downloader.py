@@ -3274,7 +3274,7 @@ def embed_metadata(
 
         if meta.get("isrc"):
             audio["----:com.apple.iTunes:ISRC"] = [
-                meta["isrc"]
+                meta["isrc"].encode("utf-8")
             ]
 
         # Replace existing embedded artwork so the selected Cover Art
@@ -3321,17 +3321,19 @@ def download_track(
     meta,
     folder,
 ):
-    filename = (
-        safe_filename(
-            meta["title"]
-        )
-        + ".m4a"
+    # yt-dlp's audio postprocessor adds the ALAC container extension
+    # itself.  Pass it the filename without an extension so it creates
+    # Song.m4a instead of Song.m4a.m4a.
+    filename = safe_filename(
+        meta["title"]
     )
 
-    output = os.path.join(
+    output_base = os.path.join(
         folder,
         filename,
     )
+
+    output = output_base + ".m4a"
 
     if os.path.isfile(
         output
@@ -3362,13 +3364,18 @@ def download_track(
         result = run_ytdlp(
             ytdlp_args()
             + [
+                # Select the best audio source available.
+                # ALAC itself is lossless; the source stream determines
+                # the actual audio quality.
+                "-f",
+                "bestaudio",
                 "-x",
                 "--audio-format",
                 "alac",
                 "--ffmpeg-location",
                 FFMPEG,
                 "-o",
-                output,
+                output_base,
                 url,
             ]
         )
