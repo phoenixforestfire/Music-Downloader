@@ -1111,6 +1111,17 @@ def release_candidates(recording):
                     "script",
                     "",
                 ),
+                "comment": release.get(
+                    "disambiguation",
+                    "",
+                ) or release.get(
+                    "comment",
+                    "",
+                ),
+                "packaging": release.get(
+                    "packaging",
+                    "",
+                ),
                 "track_count": release.get(
                     "track-count",
                     0,
@@ -1615,6 +1626,12 @@ def search_releases_for_artwork(meta):
                     "country": release.get("country", "") or "",
                     "language": release.get("language", "") or "",
                     "script": release.get("script", "") or "",
+                    "comment": (
+                        release.get("disambiguation", "")
+                        or release.get("comment", "")
+                        or ""
+                    ),
+                    "packaging": release.get("packaging", "") or "",
                 }
             )
 
@@ -1670,6 +1687,50 @@ def artwork_locale_score(release):
     return score
 
 
+def artwork_edition_tier(release):
+    """Prefer the normal release over signed/autographed artwork editions.
+
+    MusicBrainz can have several releases of the same album with different
+    cover art. A signed/autographed physical edition can therefore compete
+    with the normal album release. For artwork only, regular releases get
+    the highest edition tier, while releases explicitly marked as signed or
+    autographed are placed below them.
+
+    2 = regular / not explicitly signed
+    1 = signed or autographed edition
+    """
+    title = normalize_text(release.get("album", ""))
+    comment = normalize_text(release.get("comment", ""))
+    packaging = normalize_text(release.get("packaging", ""))
+
+    combined = " ".join(
+        part
+        for part in (title, comment, packaging)
+        if part
+    )
+
+    signed_terms = (
+        "signed",
+        "autographed",
+        "autograph",
+    )
+
+    if any(
+        re.search(r"\b" + re.escape(term) + r"\b", combined)
+        for term in signed_terms
+    ):
+        return 1
+
+    return 2
+
+
+def artwork_edition_score(release):
+    """Return a large artwork-only preference for regular vs signed art."""
+    if artwork_edition_tier(release) == 1:
+        return -30000
+    return 30000
+
+
 def artwork_release_score(release, meta):
     """Score an album release specifically for artwork use."""
     score = 0
@@ -1683,6 +1744,10 @@ def artwork_release_score(release, meta):
     }
 
     score += artist_affinity(meta.get("artist", ""), artist)
+
+    # Prefer the regular album release over explicitly signed/autographed
+    # editions before applying regional/language preferences.
+    score += artwork_edition_score(release)
 
     # Prefer English (US) releases when several valid releases have the same
     # album identity and requested recording.
@@ -1757,6 +1822,10 @@ def recording_artwork_score(candidate, meta):
     wanted_title = meta.get("title", "")
     wanted_artist = meta.get("artist", "")
     wanted_album = meta.get("album", "")
+
+    # Prefer the regular album release over explicitly signed/autographed
+    # editions before applying regional/language preferences.
+    score += artwork_edition_score(release)
 
     # Locale is only a ranking preference. The later verification step still
     # requires the release to match the requested album and contain the song.
@@ -1918,6 +1987,12 @@ def release_group_artwork_candidates(choices, meta, limit=20):
                 "country": release.get("country", "") or "",
                 "language": release.get("language", "") or "",
                 "script": release.get("script", "") or "",
+                "comment": (
+                    release.get("disambiguation", "")
+                    or release.get("comment", "")
+                    or ""
+                ),
+                "packaging": release.get("packaging", "") or "",
                 "release_group_id": group_id,
             }
             if meta.get("album") and not strict_artwork_album_match(
@@ -1990,31 +2065,47 @@ def verify_artwork_releases(release_ids, meta, limit=15):
             "country": release.get("country", "") or "",
             "language": release.get("language", "") or "",
             "script": release.get("script", "") or "",
+            "comment": (
+                release.get("disambiguation", "")
+                or release.get("comment", "")
+                or ""
+            ),
+            "packaging": release.get("packaging", "") or "",
         })
 
-    # Do not stop before sorting. A Japanese/UK release can appear early in
-    # the MusicBrainz results while the preferred English/US release appears
-    # later. Every candidate must be verified before locale preference is
-    # applied.
+    # Do not stop before sorting. A signed/alternate release can appear early
+    # in the MusicBrainz results while the preferred regular release appears
+    # later. Every candidate must be verified before edition and locale
+    # preferences are applied.
 
     verified.sort(
         key=lambda x: (
+            -artwork_edition_tier(x),
             -artwork_locale_tier(x),
             -artwork_release_score(x, meta),
             normalize_text(x.get("album", "")),
         )
     )
 
-    # Prefer the highest locale tier that actually exists. In particular, if
-    # an English/US release is available, do not fall back to Japanese, UK,
-    # or another regional release merely because it appeared earlier.
+    # Edition type is the first preference: when a regular release is
+    # available, do not let explicitly signed/autographed artwork replace it.
+    # Within the preferred edition type, keep the existing English/US locale
+    # preference.
     if verified:
-        best_tier = artwork_locale_tier(verified[0])
+        best_edition_tier = artwork_edition_tier(verified[0])
         verified = [
             x
             for x in verified
-            if artwork_locale_tier(x) == best_tier
+            if artwork_edition_tier(x) == best_edition_tier
         ]
+
+        if verified:
+            best_locale_tier = artwork_locale_tier(verified[0])
+            verified = [
+                x
+                for x in verified
+                if artwork_locale_tier(x) == best_locale_tier
+            ]
 
     return [x["release_id"] for x in verified[:limit]]
 
